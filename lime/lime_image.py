@@ -1,7 +1,9 @@
 """
 Functions for explaining classifiers that use Image data.
 """
+from __future__ import print_function
 import copy
+import os
 from functools import partial
 
 import numpy as np
@@ -80,6 +82,90 @@ class ImageExplanation(object):
             return temp, mask
 
 
+class FindCommonHull(object):
+    def __init__(self,image_o,image_t,segments_o,segments_t):
+        self.image_o = image_o
+        self.image_t = image_t
+        self.segments_o = segments_o
+        self.segments_t = segments_t
+        self.intercept_t = {}
+        self.local_exp_t = {}
+        self.local_pred_t = None
+        self.intercept_o = {}
+        self.local_exp_o = {}
+        self.local_pred_o = None
+
+    def find_common_hull(self,label_o,label_t,classifier_fn,tgt_percent,ori_percent):
+        if ((label_o not in self.local_exp_o) or (label_t not in self.local_exp_t)):
+            raise KeyError('Label not in explanation')
+        segments_o = self.segments_o
+        image_o = self.image_o
+        exp_o = self.local_exp_o[label_o]
+        mask_o = np.ones(segments_o.shape, segments_o.dtype)
+        temp2 = self.image_o.copy()
+        len_o=len(exp_o)
+        segments_t = self.segments_t
+        image_t = self.image_t
+        exp_t = self.local_exp_t[label_t]
+        mask_t = np.ones(segments_t.shape, segments_t.dtype)
+        temp4 = self.image_t.copy()
+        len_t=len(exp_t)
+        area_per=0
+        min_area=1.0
+
+        weight_o =[]
+        fs_o2 = [x for x in exp_o if x[1] > 0]
+        
+        for j in range(1,len_t+1):
+            mask_t = np.ones(segments_t.shape, segments_t.dtype)
+            temp3 = np.zeros(self.image_t.shape)
+            fs_t = [x[0] for x in exp_t if x[1] > 0][:j]
+            for f in fs_t:
+                temp3[segments_t == f] = image_t[segments_t == f].copy()
+                mask_t[segments_t == f] = 0
+            new_result_t=(temp3)/2+0.5
+            num1 = float(np.sum(mask_t == 0))
+            percent = num1/(299*299)
+            for i in range(1,len_o+1):
+                mask_o = np.ones(segments_o.shape, segments_o.dtype)
+                temp1 = np.zeros(self.image_o.shape)
+                fs_o = [x[0] for x in exp_o if x[1] > 0][:i]
+                for f in fs_o:
+                    temp1[segments_o == f] = image_o[segments_o == f].copy()
+                    mask_o[segments_o == f] = 0
+                new_result_o=(temp1)/2+0.5
+                num2 = float(np.sum(mask_o == 0))
+                percent2 = num2/(299*299)
+                image_remix = copy.deepcopy(image_o)
+                mask = mask_o + mask_t
+                mask = mask < 1.5
+                num3 = float(np.sum(mask == True))
+                percent3 = num3/(299*299)
+                image_remix[mask]=copy.deepcopy(image_t[mask])
+                x1 = image_remix[np.newaxis, :]
+                preds = classifier_fn(x1)
+                preds_sys = np.argmax(preds)
+                if preds_sys == label_t and percent2 > ori_percent and percent > tgt_percent:
+                    if percent3 < min_area:
+                        min_area = percent3
+                        image_remixMin = image_remix
+                        maskMin = mask
+                        iMin = i
+                        jMin = j
+                        percentMin = percent
+                        percent2Min = percent2
+                        logit = preds[0,preds_sys]
+                    break
+                elif((i==len_o and j==len_t) and min_area == 1.0):
+                    print("attack failed!")
+                    return
+        print("origin_part%d 's percent is %f" %(iMin,percent2Min))
+        print("target_part%d 's percent is %f " %(jMin,percentMin))
+        print("Final percent is %f" % min_area)
+        print("class %d 's origin_%d_target_%d's classify as %d 's logit is %f" %(label_o,iMin,jMin,label_t,logit))
+        return min_area,logit,iMin,jMin,image_remixMin,maskMin
+        
+ 
 class LimeImageExplainer(object):
     """Explains predictions on Image (i.e. matrix) data.
     For numerical features, perturb them by sampling from a Normal(0,1) and
@@ -167,6 +253,7 @@ class LimeImageExplainer(object):
             image = gray2rgb(image)
         if random_seed is None:
             random_seed = self.random_state.randint(0, high=1000)
+            print("random_seed is :{}".format(random_seed))
 
         if segmentation_fn is None:
             segmentation_fn = SegmentationAlgorithm('quickshift', kernel_size=4,
@@ -259,3 +346,102 @@ class LimeImageExplainer(object):
             preds = classifier_fn(np.array(imgs))
             labels.extend(preds)
         return data, np.array(labels)
+    
+    def explain_instance_ot(self, image_o, image_t, classifier_fn, labels=(1,),
+                         hide_color=None,
+                         top_labels=5, num_features=100000, num_samples=1000,
+                         batch_size=10,
+                         segmentation_fn=None,
+                         distance_metric='cosine',
+                         model_regressor=None,
+                         random_seed=None):
+
+        if random_seed is None:
+            random_seed = self.random_state.randint(0, high=1000)
+            print("random_seed is :{}".format(random_seed))
+
+        if segmentation_fn is None:
+            segmentation_fn = SegmentationAlgorithm('quickshift', kernel_size=4,
+                                                    max_dist=200, ratio=0.2,
+                                                    random_seed=random_seed)
+        try:
+            segments_o = segmentation_fn(image_o)
+        except ValueError as e:
+            raise e
+
+        try:
+            segments_t = segmentation_fn(image_t)
+        except ValueError as e:
+            raise e
+
+        fudged_image = image_o.copy()
+        if hide_color is None:
+            for x in np.unique(segments_o):
+                fudged_image[segments_o == x] = (
+                    np.mean(image_o[segments_o == x][:, 0]),
+                    np.mean(image_o[segments_o == x][:, 1]),
+                    np.mean(image_o[segments_o == x][:, 2]))
+        else:
+            fudged_image[:] = hide_color
+
+        top = labels
+
+        data, labels = self.data_labels(image_o, fudged_image, segments_o,
+                                        classifier_fn, num_samples,
+                                        batch_size=batch_size)
+
+        distances = sklearn.metrics.pairwise_distances(
+            data,
+            data[0].reshape(1, -1),
+            metric=distance_metric
+        ).ravel()
+
+        ret_exp_ot = FindCommonHull(image_o,image_t,segments_o,segments_t)
+        if top_labels:
+            top = np.argsort(labels[0])[-top_labels:]
+            ret_exp_ot.top_labels_o = list(top)
+            ret_exp_ot.top_labels_o.reverse()
+        for label in top:
+            (ret_exp_ot.intercept_o[label],
+             ret_exp_ot.local_exp_o[label],
+             ret_exp_ot.score_o, ret_exp_ot.local_pred_o) = self.base.explain_instance_with_data(
+                data, labels, distances, label, num_features,
+                model_regressor=model_regressor,
+                feature_selection=self.feature_selection)
+
+
+        fudged_image_t = image_t.copy()
+        if hide_color is None:
+            for x in np.unique(segments_t):
+                fudged_image_t[segments_y == x] = (
+                    np.mean(image_t[segments_t == x][:, 0]),
+                    np.mean(image_t[segments_t == x][:, 1]),
+                    np.mean(image_t[segments_t == x][:, 2]))
+        else:
+            fudged_image_t[:] = hide_color
+
+        top_t = labels
+
+        data_t, labels_t = self.data_labels(image_t, fudged_image_t, segments_t,
+                                        classifier_fn, num_samples,
+                                        batch_size=batch_size)
+
+        distances_t = sklearn.metrics.pairwise_distances(
+            data_t,
+            data_t[0].reshape(1, -1),
+            metric=distance_metric
+        ).ravel()
+
+
+        if top_labels:
+            top_t = np.argsort(labels_t[0])[-top_labels:]
+            ret_exp_ot.top_labels_t = list(top_t)
+            ret_exp_ot.top_labels_t.reverse()
+        for label in top_t:
+            (ret_exp_ot.intercept_t[label],
+             ret_exp_ot.local_exp_t[label],
+             ret_exp_ot.score_t, ret_exp_ot.local_pred_t) = self.base.explain_instance_with_data(
+                data_t, labels_t, distances_t, label, num_features,
+                model_regressor=model_regressor,
+                feature_selection=self.feature_selection)
+        return ret_exp_ot
